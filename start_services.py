@@ -1,542 +1,242 @@
-name: yasmines-local-ai
+#!/usr/bin/env python3
+"""
+start_services.py
 
-volumes:
-  n8n_storage:
-  qdrant_storage:
-  open-webui:
-  flowise:
-  caddy-data:
-  caddy-config:
-  valkey-data:
-  supabase-db-data:
-  supabase-storage-data:
+This script starts the Supabase stack first, waits for it to initialize, and then starts
+the local AI stack. Both stacks use the same Docker Compose project name ("yasmines-local-ai")
+so they appear together in Docker Desktop.
+"""
 
-networks:
-  yasmines-local-ai:
-    name: "yasmines-local-ai"
+import os
+import subprocess
+import shutil
+import time
+import argparse
+import platform
+import sys
 
-x-n8n: &service-n8n
-  image: n8nio/n8n:next
-  networks:
-    - yasmines-local-ai
-  environment:
-    - DB_TYPE=postgresdb
-    - DB_POSTGRESDB_HOST=supabase-db
-    - DB_POSTGRESDB_USER=postgres
-    - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
-    - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
-    - N8N_DIAGNOSTICS_ENABLED=false
-    - N8N_PERSONALIZATION_ENABLED=false
-    - N8N_ENCRYPTION_KEY
-    - N8N_USER_MANAGEMENT_JWT_SECRET
-    - OLLAMA_HOST=host.docker.internal:11434
-    - N8N_HOST=localhost
-    - N8N_PORT=5678
-    - N8N_EDITOR_BASE_URL=http://localhost:5678
-    - WEBHOOK_URL=http://localhost:5678
-    - TZ=America/New_York
-    - GENERIC_TIMEZONE=America/New_York
-    - NODE_FUNCTION_ALLOW_BUILTIN=*
-    - NODE_FUNCTION_ALLOW_EXTERNAL=*
-    - EXECUTIONS_DATA_SAVE_ON_ERROR=all
-    - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
-    - EXECUTIONS_DATA_SAVE_ON_PROGRESS=true
-    - N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE=true
+def run_command(cmd, cwd=None):
+    """Run a shell command and print it."""
+    print("Running:", " ".join(cmd))
+    subprocess.run(cmd, cwd=cwd, check=True)
 
-services:
-  # Local AI services
-  flowise:
-    image: flowiseai/flowise
-    restart: unless-stopped
-    container_name: flowise
-    networks:
-      - yasmines-local-ai
-    environment:
-      - PORT=3001
-    ports:
-      - 3001:3001
-    extra_hosts:
-      - "host.docker.internal:host-gateway"        
-    volumes:
-      - ~/.flowise:/root/.flowise
-    entrypoint: /bin/sh -c "sleep 3; flowise start"
+def clone_supabase_repo():
+    """Clone the Supabase repository using sparse checkout if not already present."""
+    if not os.path.exists("supabase"):
+        print("Cloning the Supabase repository...")
+        run_command([
+            "git", "clone", "--filter=blob:none", "--no-checkout",
+            "https://github.com/supabase/supabase.git"
+        ])
+        os.chdir("supabase")
+        run_command(["git", "sparse-checkout", "init", "--cone"])
+        run_command(["git", "sparse-checkout", "set", "docker"])
+        run_command(["git", "checkout", "master"])
+        os.chdir("..")
+    else:
+        print("Supabase repository already exists, updating...")
+        os.chdir("supabase")
+        run_command(["git", "pull"])
+        os.chdir("..")
 
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    restart: unless-stopped
-    container_name: open-webui
-    networks:
-      - yasmines-local-ai
-    ports:
-      - "3000:8080"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - open-webui:/app/backend/data
+def prepare_supabase_env():
+    """Copy .env to .env in supabase/docker."""
+    env_path = os.path.join("supabase", "docker", ".env")
+    env_example_path = os.path.join(".env")
+    print("Copying .env in root to .env in supabase/docker...")
+    shutil.copyfile(env_example_path, env_path)
 
-  n8n-import:
-    <<: *service-n8n
-    container_name: n8n-import
-    entrypoint: /bin/sh
-    command:
-      - "-c"
-      - "n8n import:credentials --separate --input=/backup/credentials && n8n import:workflow --separate --input=/backup/workflows"
-    volumes:
-      - ./n8n/backup:/backup  
-    depends_on:
-      supabase-db:
-        condition: service_healthy
+def stop_existing_containers():
+    """Stop and remove existing containers for our unified project ('yasmines-local-ai')."""
+    print("Stopping and removing existing containers for the unified project 'yasmines-local-ai'...")
+    run_command([
+        "docker", "compose",
+        "-p", "yasmines-local-ai",
+        "-f", "docker-compose.yml",
+        "-f", "supabase/docker/docker-compose.yml",
+        "down"
+    ])
 
-  n8n:
-    <<: *service-n8n
-    container_name: n8n
-    restart: always
-    ports:
-      - 5678:5678
-    volumes:
-      - n8n_storage:/home/node/.n8n
-      - ./n8n/backup:/backup
-      - ./shared:/data/shared
-    depends_on:
-      n8n-import:
-        condition: service_completed_successfully
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5678"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
+def start_supabase():
+    """Start the Supabase services (using its compose file)."""
+    print("Starting Supabase services...")
+    run_command([
+        "docker", "compose", "-p", "yasmines-local-ai", "-f", "supabase/docker/docker-compose.yml", "up", "-d"
+    ])
 
-  qdrant:
-    image: qdrant/qdrant
-    container_name: qdrant
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    ports:
-      - 6333:6333
-    volumes:
-      - qdrant_storage:/qdrant/storage
+def start_local_ai(profile=None):
+    """Start the local AI services (using its compose file)."""
+    print("Starting local AI services...")
+    cmd = ["docker", "compose", "-p", "yasmines-local-ai"]
+    if profile and profile != "none":
+        cmd.extend(["--profile", profile])
+    cmd.extend(["-f", "docker-compose.yml", "up", "-d"])
+    run_command(cmd)
 
-  caddy:
-    container_name: caddy
-    image: docker.io/library/caddy:2-alpine
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data:rw
-      - caddy-config:/config:rw
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      - N8N_HOSTNAME=${N8N_HOSTNAME:-":8001"}
-      - WEBUI_HOSTNAME=${WEBUI_HOSTNAME:-":8002"}
-      - FLOWISE_HOSTNAME=${FLOWISE_HOSTNAME:-":8003"}
-      - OLLAMA_HOSTNAME=${OLLAMA_HOSTNAME:-":8004"}
-      - SUPABASE_HOSTNAME=${SUPABASE_HOSTNAME:-":8005"}
-      - SEARXNG_HOSTNAME=${SEARXNG_HOSTNAME:-":8006"}
-      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-internal}
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_BIND_SERVICE
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "1m"
-        max-file: "1"
-
-  redis:
-    container_name: redis
-    image: docker.io/valkey/valkey:8-alpine
-    networks:
-      - yasmines-local-ai
-    command: valkey-server --save 30 1 --loglevel warning
-    restart: unless-stopped
-    volumes:
-      - valkey-data:/data
-    cap_drop:
-      - ALL
-    cap_add:
-      - SETGID
-      - SETUID
-      - DAC_OVERRIDE
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "1m"
-        max-file: "1"
-
-  searxng:
-    container_name: searxng
-    image: docker.io/searxng/searxng:latest
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    ports:
-      - 8080:8080
-    volumes:
-      - ./searxng:/etc/searxng:rw
-    environment:
-      - SEARXNG_BASE_URL=https://${SEARXNG_HOSTNAME:-localhost}/
-      - UWSGI_WORKERS=${SEARXNG_UWSGI_WORKERS:-4}
-      - UWSGI_THREADS=${SEARXNG_UWSGI_THREADS:-4}
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "1m"
-        max-file: "1"
+def generate_searxng_secret_key():
+    """Generate a secret key for SearXNG based on the current platform."""
+    print("Checking SearXNG settings...")
+    
+    # Define paths for SearXNG settings files
+    settings_path = os.path.join("searxng", "settings.yml")
+    settings_base_path = os.path.join("searxng", "settings-base.yml")
+    
+    # Check if settings-base.yml exists
+    if not os.path.exists(settings_base_path):
+        print(f"Warning: SearXNG base settings file not found at {settings_base_path}")
+        return
+    
+    # Check if settings.yml exists, if not create it from settings-base.yml
+    if not os.path.exists(settings_path):
+        print(f"SearXNG settings.yml not found. Creating from {settings_base_path}...")
+        try:
+            shutil.copyfile(settings_base_path, settings_path)
+            print(f"Created {settings_path} from {settings_base_path}")
+        except Exception as e:
+            print(f"Error creating settings.yml: {e}")
+            return
+    else:
+        print(f"SearXNG settings.yml already exists at {settings_path}")
+    
+    print("Generating SearXNG secret key...")
+    
+    # Detect the platform and run the appropriate command
+    system = platform.system()
+    
+    try:
+        if system == "Windows":
+            print("Detected Windows platform, using PowerShell to generate secret key...")
+            # PowerShell command to generate a random key and replace in the settings file
+            ps_command = [
+                "powershell", "-Command",
+                "$randomBytes = New-Object byte[] 32; " +
+                "(New-Object Security.Cryptography.RNGCryptoServiceProvider).GetBytes($randomBytes); " +
+                "$secretKey = -join ($randomBytes | ForEach-Object { \"{0:x2}\" -f $_ }); " +
+                "(Get-Content searxng/settings.yml) -replace 'ultrasecretkey', $secretKey | Set-Content searxng/settings.yml"
+            ]
+            subprocess.run(ps_command, check=True)
+            
+        elif system == "Darwin":  # macOS
+            print("Detected macOS platform, using sed command with empty string parameter...")
+            # macOS sed command requires an empty string for the -i parameter
+            openssl_cmd = ["openssl", "rand", "-hex", "32"]
+            random_key = subprocess.check_output(openssl_cmd).decode('utf-8').strip()
+            sed_cmd = ["sed", "-i", "", f"s|ultrasecretkey|{random_key}|g", settings_path]
+            subprocess.run(sed_cmd, check=True)
+            
+        else:  # Linux and other Unix-like systems
+            print("Detected Linux/Unix platform, using standard sed command...")
+            # Standard sed command for Linux
+            openssl_cmd = ["openssl", "rand", "-hex", "32"]
+            random_key = subprocess.check_output(openssl_cmd).decode('utf-8').strip()
+            sed_cmd = ["sed", "-i", f"s|ultrasecretkey|{random_key}|g", settings_path]
+            subprocess.run(sed_cmd, check=True)
+            
+        print("SearXNG secret key generated successfully.")
         
-  # Supabase services
-  supabase-studio:
-    container_name: supabase-studio
-    image: supabase/studio:20250317-6955350
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://supabase-studio:3000/api/platform/profile').then((r) => {if (r.status !== 200) throw new Error(r.status)})"
-        ]
-      timeout: 10s
-      interval: 5s
-      retries: 3
-    depends_on:
-      supabase-analytics:
-        condition: service_healthy
-    environment:
-      STUDIO_PG_META_URL: http://supabase-meta:8080
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    except Exception as e:
+        print(f"Error generating SearXNG secret key: {e}")
+        print("You may need to manually generate the secret key using the commands:")
+        print("  - Linux: sed -i \"s|ultrasecretkey|$(openssl rand -hex 32)|g\" searxng/settings.yml")
+        print("  - macOS: sed -i '' \"s|ultrasecretkey|$(openssl rand -hex 32)|g\" searxng/settings.yml")
+        print("  - Windows (PowerShell):")
+        print("    $randomBytes = New-Object byte[] 32")
+        print("    (New-Object Security.Cryptography.RNGCryptoServiceProvider).GetBytes($randomBytes)")
+        print("    $secretKey = -join ($randomBytes | ForEach-Object { \"{0:x2}\" -f $_ })")
+        print("    (Get-Content searxng/settings.yml) -replace 'ultrasecretkey', $secretKey | Set-Content searxng/settings.yml")
 
-      DEFAULT_ORGANIZATION_NAME: ${STUDIO_DEFAULT_ORGANIZATION:-Default Organization}
-      DEFAULT_PROJECT_NAME: ${STUDIO_DEFAULT_PROJECT:-Default Project}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+def check_and_fix_docker_compose_for_searxng():
+    """Check and modify docker-compose.yml for SearXNG first run."""
+    docker_compose_path = "docker-compose.yml"
+    if not os.path.exists(docker_compose_path):
+        print(f"Warning: Docker Compose file not found at {docker_compose_path}")
+        return
+    
+    try:
+        # Read the docker-compose.yml file
+        with open(docker_compose_path, 'r') as file:
+            content = file.read()
+        
+        # Default to first run
+        is_first_run = True
+        
+        # Check if Docker is running and if the SearXNG container exists
+        try:
+            # Check if the SearXNG container is running
+            container_check = subprocess.run(
+                ["docker", "ps", "--filter", "name=searxng", "--format", "{{.Names}}"],
+                capture_output=True, text=True, check=True
+            )
+            searxng_containers = container_check.stdout.strip().split('\n')
+            
+            # If SearXNG container is running, check inside for uwsgi.ini
+            if any(container for container in searxng_containers if container):
+                container_name = next(container for container in searxng_containers if container)
+                print(f"Found running SearXNG container: {container_name}")
+                
+                # Check if uwsgi.ini exists inside the container
+                container_check = subprocess.run(
+                    ["docker", "exec", container_name, "sh", "-c", "[ -f /etc/searxng/uwsgi.ini ] && echo 'found' || echo 'not_found'"],
+                    capture_output=True, text=True, check=True
+                )
+                
+                if "found" in container_check.stdout:
+                    print("Found uwsgi.ini inside the SearXNG container - not first run")
+                    is_first_run = False
+                else:
+                    print("uwsgi.ini not found inside the SearXNG container - first run")
+                    is_first_run = True
+            else:
+                print("No running SearXNG container found - assuming first run")
+        except Exception as e:
+            print(f"Error checking Docker container: {e} - assuming first run")
+        
+        if is_first_run and "cap_drop: - ALL" in content:
+            print("First run detected for SearXNG. Temporarily removing 'cap_drop: - ALL' directive...")
+            # Temporarily comment out the cap_drop line
+            modified_content = content.replace("cap_drop: - ALL", "# cap_drop: - ALL  # Temporarily commented out for first run")
+            
+            # Write the modified content back
+            with open(docker_compose_path, 'w') as file:
+                file.write(modified_content)
+                
+            print("Note: After the first run completes successfully, you should re-add 'cap_drop: - ALL' to docker-compose.yml for security reasons.")
+        elif not is_first_run and "# cap_drop: - ALL  # Temporarily commented out for first run" in content:
+            print("SearXNG has been initialized. Re-enabling 'cap_drop: - ALL' directive for security...")
+            # Uncomment the cap_drop line
+            modified_content = content.replace("# cap_drop: - ALL  # Temporarily commented out for first run", "cap_drop: - ALL")
+            
+            # Write the modified content back
+            with open(docker_compose_path, 'w') as file:
+                file.write(modified_content)
+    
+    except Exception as e:
+        print(f"Error checking/modifying docker-compose.yml for SearXNG: {e}")
 
-      SUPABASE_URL: http://supabase-kong:8000
-      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
-      SUPABASE_ANON_KEY: ${ANON_KEY}
-      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
-      AUTH_JWT_SECRET: ${JWT_SECRET}
+def main():
+    parser = argparse.ArgumentParser(description='Start the local AI and Supabase services.')
+    parser.add_argument('--profile', choices=['cpu', 'gpu-nvidia', 'gpu-amd', 'none'], default='cpu',
+                      help='Profile to use for Docker Compose (default: cpu)')
+    args = parser.parse_args()
 
-      LOGFLARE_API_KEY: ${LOGFLARE_API_KEY:-}
-      LOGFLARE_URL: http://supabase-analytics:4000
-      NEXT_PUBLIC_ENABLE_LOGS: true
-      NEXT_ANALYTICS_BACKEND_PROVIDER: postgres
+    clone_supabase_repo()
+    prepare_supabase_env()
+    
+    # Generate SearXNG secret key and check docker-compose.yml
+    generate_searxng_secret_key()
+    check_and_fix_docker_compose_for_searxng()
+    
+    stop_existing_containers()
+    
+    # Start Supabase first
+    start_supabase()
+    
+    # Give Supabase some time to initialize
+    print("Waiting for Supabase to initialize...")
+    time.sleep(10)
+    
+    # Then start the local AI services
+    start_local_ai(args.profile)
 
-  supabase-kong:
-    container_name: supabase-kong
-    image: kong:2.8.1
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    ports:
-      - ${KONG_HTTP_PORT}:8000/tcp
-      - ${KONG_HTTPS_PORT}:8443/tcp
-    volumes:
-      - ./supabase/docker/volumes/api/kong.yml:/home/kong/kong.yml:ro
-    depends_on:
-      supabase-analytics:
-        condition: service_healthy
-    environment:
-      KONG_DATABASE: "off"
-      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
-      KONG_DNS_ORDER: LAST,A,CNAME
-      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
-      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
-      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
-
-  supabase-auth:
-    container_name: supabase-auth
-    image: supabase/gotrue:v2.170.0
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "wget",
-          "--no-verbose",
-          "--tries=1",
-          "--spider",
-          "http://localhost:9999/health"
-        ]
-      timeout: 5s
-      interval: 5s
-      retries: 3
-    depends_on:
-      supabase-db:
-        condition: service_healthy
-      supabase-analytics:
-        condition: service_healthy
-    environment:
-      GOTRUE_API_HOST: 0.0.0.0
-      GOTRUE_API_PORT: 9999
-      API_EXTERNAL_URL: ${API_EXTERNAL_URL:-}
-
-      GOTRUE_DB_DRIVER: postgres
-      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@supabase-db:${POSTGRES_PORT}/${POSTGRES_DB}
-
-      GOTRUE_SITE_URL: ${SITE_URL:-http://localhost:8000}
-      GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS:-}
-      GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP:-false}
-      GOTRUE_JWT_SECRET: ${JWT_SECRET}
-      GOTRUE_JWT_EXP: ${JWT_EXPIRY:-3600}
-      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
-      GOTRUE_DB_AUTOMIGRATE: "true"
-      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
-      GOTRUE_MAILER_AUTOCONFIRM: ${ENABLE_EMAIL_AUTOCONFIRM:-false}
-      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL:-}
-      GOTRUE_SMTP_HOST: ${SMTP_HOST:-}
-      GOTRUE_SMTP_PORT: ${SMTP_PORT:-}
-      GOTRUE_SMTP_USER: ${SMTP_USER:-}
-      GOTRUE_SMTP_PASS: ${SMTP_PASS:-}
-      GOTRUE_SMTP_SENDER_NAME: ${SMTP_SENDER_NAME:-}
-      GOTRUE_MAILER_URLPATHS_CONFIRMATION: ${MAILER_URLPATHS_CONFIRMATION:-/auth/v1/verify}
-      GOTRUE_MAILER_URLPATHS_INVITE: ${MAILER_URLPATHS_INVITE:-/auth/v1/verify}
-      GOTRUE_MAILER_URLPATHS_RECOVERY: ${MAILER_URLPATHS_RECOVERY:-/auth/v1/verify}
-      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: ${MAILER_URLPATHS_EMAIL_CHANGE:-/auth/v1/verify}
-
-      GOTRUE_EXTERNAL_PHONE_ENABLED: "true"
-      GOTRUE_SMS_AUTOCONFIRM: ${ENABLE_PHONE_AUTOCONFIRM:-}
-
-      # GitHub OAuth
-      GOTRUE_EXTERNAL_GITHUB_ENABLED: "false"
-      GOTRUE_EXTERNAL_GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
-      GOTRUE_EXTERNAL_GITHUB_SECRET: ${GITHUB_SECRET:-}
-      GOTRUE_EXTERNAL_GITHUB_REDIRECT_URI: ${SITE_URL:-http://localhost:8000}/auth/v1/callback
-      
-      GOTRUE_ENABLE_ANONYMOUS_USERS: ${ENABLE_ANONYMOUS_USERS:-false}
-      GOTRUE_RATE_LIMIT_EMAIL_SENT: 6
-      GOTRUE_RATE_LIMIT_ANONYMOUS_USERS: 3
-
-      GOTRUE_SECURITY_REFRESH_TOKEN_ROTATION_ENABLED: true
-      GOTRUE_MFA_ENABLED: true
-
-      # SMS Provider settings
-      GOTRUE_SMS_PROVIDER: "twilio"
-      GOTRUE_SMS_TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
-      GOTRUE_SMS_TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
-      GOTRUE_SMS_TWILIO_MESSAGE_SERVICE_SID: ${TWILIO_MESSAGE_SERVICE_SID:-}
-      
-      ENABLE_EMAIL_SIGNUP: ${ENABLE_EMAIL_SIGNUP:-true}
-      ENABLE_PHONE_SIGNUP: ${ENABLE_PHONE_SIGNUP:-true}
-      
-  supabase-rest:
-    container_name: supabase-rest
-    image: postgrest/postgrest:v11.1.0
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    depends_on:
-      supabase-db:
-        condition: service_healthy
-    environment:
-      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@supabase-db:${POSTGRES_PORT}/${POSTGRES_DB}
-      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public,storage,graphql_public}
-      PGRST_DB_ANON_ROLE: anon
-      PGRST_JWT_SECRET: ${JWT_SECRET}
-      PGRST_DB_USE_LEGACY_GUCS: "false"
-      PGRST_DB_MAX_ROWS: 1000
-
-  supabase-realtime:
-    container_name: supabase-realtime
-    image: supabase/realtime:v2.25.39
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    depends_on:
-      supabase-db:
-        condition: service_healthy
-    environment:
-      DB_HOST: supabase-db
-      DB_PORT: ${POSTGRES_PORT}
-      DB_NAME: ${POSTGRES_DB}
-      DB_USER: supabase_admin
-      DB_PASSWORD: ${POSTGRES_PASSWORD}
-      DB_SSL: "false"
-      PORT: 4000
-      METRICS_PORT: 4001
-      API_JWT_SECRET: ${JWT_SECRET}
-      FLY_ALLOC_ID: fly123
-      FLY_APP_NAME: realtime
-      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
-      ERL_AFLAGS: -proto_dist inet_tcp
-      ENABLE_TAILSCALE: "false"
-      DNS_NODES: "''"
-
-  supabase-db:
-    container_name: supabase-db
-    image: supabase/postgres:15.1.0.147-preview1
-    networks:
-      - yasmines-local-ai
-    healthcheck:
-      test: pg_isready -U postgres -h localhost
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
-    volumes:
-      - supabase-db-data:/var/lib/postgresql/data
-      - ./supabase/docker/volumes/db/init:/docker-entrypoint-initdb.d
-    restart: unless-stopped
-    ports:
-      - ${POSTGRES_PORT}:5432
-    environment:
-      POSTGRES_HOST: /var/run/postgresql
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_PORT: ${POSTGRES_PORT}
-
-  supabase-meta:
-    container_name: supabase-meta
-    image: supabase/postgres-meta:v0.75.0
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    environment:
-      PG_META_PORT: 8080
-      PG_META_DB_HOST: supabase-db
-      PG_META_DB_PORT: ${POSTGRES_PORT}
-      PG_META_DB_NAME: ${POSTGRES_DB}
-      PG_META_DB_USER: supabase_admin
-      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
-
-  supabase-imgproxy:
-    container_name: supabase-imgproxy
-    image: darthsim/imgproxy:v3.8.0
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    environment:
-      IMGPROXY_BIND: ":5001"
-      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /
-      IMGPROXY_USE_ETAG: "true"
-      IMGPROXY_ENABLE_WEBP_DETECTION: ${IMGPROXY_ENABLE_WEBP_DETECTION:-false}
-
-  supabase-pooler:
-    container_name: supabase-pooler
-    image: supabase/pgbouncer:1.19.0
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    depends_on:
-      supabase-db:
-        condition: service_healthy
-    environment:
-      POSTGRESQL_HOST: supabase-db
-      POSTGRESQL_PORT: ${POSTGRES_PORT}
-      POSTGRESQL_USERNAME: supabase_admin
-      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRESQL_DATABASE: ${POSTGRES_DB}
-      PGBOUNCER_POOL_MODE: transaction
-      PGBOUNCER_DEFAULT_POOL_SIZE: ${POOLER_DEFAULT_POOL_SIZE}
-      PGBOUNCER_MAX_CLIENT_CONN: ${POOLER_MAX_CLIENT_CONN}
-      PGBOUNCER_LISTEN_PORT: 5432
-      PGBOUNCER_IGNORE_STARTUP_PARAMETERS: extra_float_digits,options,application_name
-      PGBOUNCER_TENANT_ID: ${POOLER_TENANT_ID:-}
-      PGBOUNCER_VERBOSE: 0
-
-  supabase-storage:
-    container_name: supabase-storage
-    image: supabase/storage-api:v0.43.15
-    networks:
-      - yasmines-local-ai
-    depends_on:
-      supabase-db:
-        condition: service_healthy
-        restart: true
-      supabase-rest:
-        condition: service_started
-        restart: true
-    restart: unless-stopped
-    environment:
-      STORAGE_BACKEND: file
-      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
-      TENANT_ID: stub
-      REGION: stub
-      GLOBAL_S3_BUCKET: stub
-      ENABLE_IMAGE_TRANSFORMATION: "true"
-      IMGPROXY_URL: http://supabase-imgproxy:5001
-      JWT_SECRET: ${JWT_SECRET}
-      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@supabase-db:${POSTGRES_PORT}/${POSTGRES_DB}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      FILE_SIZE_LIMIT: 52428800
-      STORAGE_REDIRECT_ALLOW_HOSTS: "${SUPABASE_PUBLIC_URL}"
-      PGRST_JWT_SECRET: ${JWT_SECRET}
-    volumes:
-      - supabase-storage-data:/var/lib/storage
-
-  supabase-functions:
-    container_name: supabase-edge-functions
-    image: supabase/edge-runtime:v1.22.3
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    depends_on:
-      supabase-db:
-        condition: service_healthy
-    environment:
-      JWT_SECRET: ${JWT_SECRET}
-      VERIFY_JWT: ${FUNCTIONS_VERIFY_JWT:-false}
-      PGHOST: supabase-db
-      PGPORT: ${POSTGRES_PORT}
-      PGDATABASE: ${POSTGRES_DB}
-      PGUSER: supabase_functions_admin
-      PGPASSWORD: ${POSTGRES_PASSWORD}
-      SITE_URL: ${SITE_URL:-http://localhost:8000}
-      SUPABASE_URL: http://supabase-kong:8000
-      SUPABASE_ANON_KEY: ${ANON_KEY}
-      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
-      SUPABASE_AUTH_REDIS_CONNECTION_STRING: "redis://supabase-auth-redis:6379"
-      REDIS_CONNECTION_STRING: "redis://supabase-auth-redis:6379"
-      SUPABASE_SERVE_FUNCTION_LOG_LEVEL: "debug"
-      SUPABASE_FUNCTIONS_DOCKER_EXTERNAL_NETWORK: "yasmines-local-ai"
-
-  supabase-analytics:
-    container_name: supabase-analytics
-    image: supabase/logflare:1.4.0
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
-    depends_on:
-      supabase-db:
-        condition: service_healthy
-    environment:
-      LOGFLARE_NODE_HOST: 127.0.0.1
-      LOGFLARE_SINGLE_TENANT: supabase
-      PHOENIX_SECRET: ${LOGFLARE_API_KEY:-}
-      SECRET_KEY_BASE: ${VAULT_ENC_KEY}
-      DATABASE_URL: postgres://supabase_admin:${POSTGRES_PASSWORD}@supabase-db:${POSTGRES_PORT}/${POSTGRES_DB}
-      POSTGRESQL_HOSTNAME: supabase-db
-      POSTGRESQL_PORT: ${POSTGRES_PORT}
-      POSTGRESQL_USERNAME: postgres
-      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRESQL_DATABASE: ${POSTGRES_DB}
-      ANALYZE_CHUNK_IO_CONCURRENCY: 4
-      INGEST_CHUNK_IO_CONCURRENCY: 4
-
-  supabase-auth-redis:
-    container_name: supabase-auth-redis
-    image: redis:7.2.3-alpine
-    networks:
-      - yasmines-local-ai
-    restart: unless-stopped
+if __name__ == "__main__":
+    main()
