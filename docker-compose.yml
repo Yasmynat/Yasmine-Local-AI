@@ -1,6 +1,7 @@
+name: yasmines-local-ai  # Sets the project/network name
+
 volumes:
   n8n_storage:
-  ollama_storage:
   qdrant_storage:
   open-webui:
   flowise:
@@ -8,8 +9,14 @@ volumes:
   caddy-config:
   valkey-data:  
 
+networks:
+  yasmine-network:  # Creates a custom network
+    name: "yasmines-local-ai"
+
 x-n8n: &service-n8n
-  image: n8nio/n8n:latest
+  image: n8nio/n8n:next
+  networks:
+    - yasmine-network
   environment:
     - DB_TYPE=postgresdb
     - DB_POSTGRESDB_HOST=db
@@ -20,49 +27,43 @@ x-n8n: &service-n8n
     - N8N_PERSONALIZATION_ENABLED=false
     - N8N_ENCRYPTION_KEY
     - N8N_USER_MANAGEMENT_JWT_SECRET
-
-x-ollama: &service-ollama
-  image: ollama/ollama:latest
-  container_name: ollama
-  restart: unless-stopped
-  ports:
-    - 11434:11434
-  volumes:
-    - ollama_storage:/root/.ollama
-
-x-init-ollama: &init-ollama
-  image: ollama/ollama:latest
-  container_name: ollama-pull-llama
-  volumes:
-    - ollama_storage:/root/.ollama
-  entrypoint: /bin/sh
-  command:
-    - "-c"
-    - "sleep 3; OLLAMA_HOST=ollama:11434 ollama pull qwen2.5:7b-instruct-q4_K_M; OLLAMA_HOST=ollama:11434 ollama pull nomic-embed-text"
-    # For a larger context length verison of the model, run these commands:
-    # echo "FROM qwen2.5:7b-instruct-q4_K_M\n\nPARAMETER num_ctx 8096" > Modelfile
-    # ollama create qwen2.5:7b-8k -f ./Modelfile
-    # Change the name of the LLM and num_ctx as you see fit.
+    - OLLAMA_HOST=host.docker.internal:11434
+    - N8N_HOST=localhost
+    - N8N_PORT=5678
+    - N8N_EDITOR_BASE_URL=http://localhost:5678
+    - WEBHOOK_URL=http://localhost:5678
+    - TZ=America/New_York
+    - GENERIC_TIMEZONE=America/New_York
+    - NODE_FUNCTION_ALLOW_BUILTIN=*
+    - NODE_FUNCTION_ALLOW_EXTERNAL=*
+    - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+    - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+    - EXECUTIONS_DATA_SAVE_ON_PROGRESS=true
+    - N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE=true
 
 services:
   flowise:
     image: flowiseai/flowise
     restart: unless-stopped
     container_name: flowise
+    networks:
+      - yasmine-network
     environment:
-        - PORT=3001
+      - PORT=3001
     ports:
-        - 3001:3001
+      - 3001:3001
     extra_hosts:
       - "host.docker.internal:host-gateway"        
     volumes:
-        - ~/.flowise:/root/.flowise
+      - ~/.flowise:/root/.flowise
     entrypoint: /bin/sh -c "sleep 3; flowise start"
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
     restart: unless-stopped
     container_name: open-webui
+    networks:
+      - yasmine-network
     ports:
       - "3000:8080"
     extra_hosts:
@@ -83,7 +84,7 @@ services:
   n8n:
     <<: *service-n8n
     container_name: n8n
-    restart: unless-stopped
+    restart: always
     ports:
       - 5678:5678
     volumes:
@@ -93,10 +94,17 @@ services:
     depends_on:
       n8n-import:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5678"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
 
   qdrant:
     image: qdrant/qdrant
     container_name: qdrant
+    networks:
+      - yasmine-network
     restart: unless-stopped
     ports:
       - 6333:6333
@@ -106,12 +114,16 @@ services:
   caddy:
     container_name: caddy
     image: docker.io/library/caddy:2-alpine
-    network_mode: host
+    networks:
+      - yasmine-network
     restart: unless-stopped
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data:rw
       - caddy-config:/config:rw
+    ports:
+      - "80:80"
+      - "443:443"
     environment:
       - N8N_HOSTNAME=${N8N_HOSTNAME:-":8001"}
       - WEBUI_HOSTNAME=${WEBUI_HOSTNAME:-":8002"}
@@ -133,6 +145,8 @@ services:
   redis:
     container_name: redis
     image: docker.io/valkey/valkey:8-alpine
+    networks:
+      - yasmine-network
     command: valkey-server --save 30 1 --loglevel warning
     restart: unless-stopped
     volumes:
@@ -152,6 +166,8 @@ services:
   searxng:
     container_name: searxng
     image: docker.io/searxng/searxng:latest
+    networks:
+      - yasmine-network
     restart: unless-stopped
     ports:
       - 8080:8080
@@ -171,46 +187,4 @@ services:
       driver: "json-file"
       options:
         max-size: "1m"
-        max-file: "1"      
-
-  ollama-cpu:
-    profiles: ["cpu"]
-    <<: *service-ollama
-
-  ollama-gpu:
-    profiles: ["gpu-nvidia"]
-    <<: *service-ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
-  ollama-gpu-amd:
-    profiles: ["gpu-amd"]
-    <<: *service-ollama
-    image: ollama/ollama:rocm
-    devices:
-      - "/dev/kfd"
-      - "/dev/dri"
-
-  ollama-pull-llama-cpu:
-    profiles: ["cpu"]
-    <<: *init-ollama
-    depends_on:
-      - ollama-cpu
-
-  ollama-pull-llama-gpu:
-    profiles: ["gpu-nvidia"]
-    <<: *init-ollama
-    depends_on:
-      - ollama-gpu
-
-  ollama-pull-llama-gpu-amd:
-    profiles: [gpu-amd]
-    <<: *init-ollama
-    image: ollama/ollama:rocm
-    depends_on:
-     - ollama-gpu-amd
+        max-file: "1"
