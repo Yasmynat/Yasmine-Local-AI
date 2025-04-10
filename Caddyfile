@@ -30,6 +30,16 @@
     reverse_proxy localhost:8000
 }
 
+# MinIO Console
+{$MINIO_HOSTNAME} {
+    reverse_proxy localhost:9001
+}
+
+# Archon UI
+{$ARCHON_HOSTNAME} {
+    reverse_proxy localhost:8501
+}
+
 # SearXNG
 {$SEARXNG_HOSTNAME} {
     encode zstd gzip

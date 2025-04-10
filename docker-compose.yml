@@ -8,18 +8,22 @@ volumes:
   caddy-data:
   caddy-config:
   valkey-data:  
+  minio-data:  
+  minio-config:  
+  archon-workbench:
 
 networks:
   yasmine-network:  # Creates a custom network
-    name: "yasmines-local-ai"
+    name: yasmines-local-ai_default
+    external: true
 
 x-n8n: &service-n8n
-  image: n8nio/n8n:next
+  image: n8nio/n8n:1.88.0
   networks:
     - yasmine-network
   environment:
     - DB_TYPE=postgresdb
-    - DB_POSTGRESDB_HOST=db
+    - DB_POSTGRESDB_HOST=supabase-db
     - DB_POSTGRESDB_USER=postgres
     - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
     - DB_POSTGRESDB_DATABASE=postgres
@@ -74,31 +78,20 @@ services:
   n8n-import:
     <<: *service-n8n
     container_name: n8n-import
-    entrypoint: /bin/sh
-    command:
-      - "-c"
-      - "n8n import:credentials --separate --input=/backup/credentials && n8n import:workflow --separate --input=/backup/workflows"
+    command: n8n import:workflow --input=/workflows
     volumes:
-      - ./n8n/backup:/backup  
+      - ./n8n/workflows:/workflows
+    depends_on:
+      - n8n
 
   n8n:
     <<: *service-n8n
     container_name: n8n
-    restart: always
+    restart: unless-stopped
     ports:
-      - 5678:5678
+      - "5678:5678"
     volumes:
       - n8n_storage:/home/node/.n8n
-      - ./n8n/backup:/backup
-      - ./shared:/data/shared
-    depends_on:
-      n8n-import:
-        condition: service_completed_successfully
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5678"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
 
   qdrant:
     image: qdrant/qdrant
@@ -131,6 +124,8 @@ services:
       - OLLAMA_HOSTNAME=${OLLAMA_HOSTNAME:-":8004"}
       - SUPABASE_HOSTNAME=${SUPABASE_HOSTNAME:-":8005"}
       - SEARXNG_HOSTNAME=${SEARXNG_HOSTNAME:-":8006"}
+      - MINIO_HOSTNAME=${MINIO_HOSTNAME:-":8007"}
+      - ARCHON_HOSTNAME=${ARCHON_HOSTNAME:-":8008"}
       - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-internal}
     cap_drop:
       - ALL
@@ -188,3 +183,95 @@ services:
       options:
         max-size: "1m"
         max-file: "1"
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    networks:
+      - yasmine-network
+    restart: unless-stopped
+    ports:
+      - "9000:9000"  # API port
+      - "9001:9001"  # Console port
+    volumes:
+      - minio-data:/data
+      - minio-config:/root/.minio
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server --console-address ":9001" /data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
+
+  archon-main:
+    container_name: archon-main
+    build:
+      context: ./archon
+      dockerfile: Dockerfile
+    networks:
+      - yasmine-network
+    restart: unless-stopped
+    ports:
+      - "8501:8501"  # Streamlit UI
+      - "8100:8100"  # Graph Service
+    volumes:
+      - ./archon:/app
+      - archon-workbench:/app/workbench
+    environment:
+      - OLLAMA_API_BASE=http://host.docker.internal:11434
+      - PYTHONUNBUFFERED=1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - archon-mcp
+
+  archon-mcp:
+    container_name: archon-mcp
+    build:
+      context: ./archon/mcp
+      dockerfile: Dockerfile
+    networks:
+      - yasmine-network
+    restart: unless-stopped
+    ports:
+      - "8200:8200"  # MCP Server
+    volumes:
+      - ./archon:/app
+      - archon-workbench:/app/workbench
+    environment:
+      - PYTHONUNBUFFERED=1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    networks:
+      - yasmine-network
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+      - WATCHTOWER_INTERVAL=3600  # Check for updates every hour
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"

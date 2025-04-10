@@ -1,0 +1,45 @@
+version: '3'
+
+services:
+  archon-main:
+    container_name: archon-main
+    build:
+      context: ./archon
+      dockerfile: Dockerfile
+    networks:
+      - yasmine-network
+    ports:
+      - "8501:8501"  # Streamlit UI
+      - "8100:8100"  # Graph Service
+    volumes:
+      - ./archon:/app
+      - ./archon/workbench:/app/workbench
+    environment:
+      - OLLAMA_API_BASE=http://host.docker.internal:11434
+      - PYTHONUNBUFFERED=1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - archon-mcp
+
+  archon-mcp:
+    container_name: archon-mcp
+    build:
+      context: ./archon/mcp
+      dockerfile: Dockerfile
+    networks:
+      - yasmine-network
+    ports:
+      - "8200:8200"  # MCP Server
+    volumes:
+      - ./archon:/app
+      - ./archon/workbench:/app/workbench
+    environment:
+      - PYTHONUNBUFFERED=1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  yasmine-network:
+    external: true
+    name: yasmines-local-ai_default
